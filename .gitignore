@@ -10,7 +10,7 @@ rebel.xml
 
 ### vs code ###
 .vscode
-
+code-search
 nbproject/private/
 build/
 nbbuild/
