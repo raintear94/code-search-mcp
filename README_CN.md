@@ -1,3 +1,5 @@
+[![EN](https://img.shields.io/badge/EN-README-blue)](README.md) [![中文](https://img.shields.io/badge/中文-README_CN-red)](README_CN.md)
+
 # Code Search MCP Server
 
 面向 AI 代理的高性能批量化 MCP（Model Context Protocol）代码理解工具集，专注“深度解析 + 批量并发 + 全景上下文”，用于快速探索大型代码库并降低多次往返的上下文成本。
@@ -57,4 +59,3 @@ npm run build
 
 ## 开源声明
 本项目以 MIT License 开源，欢迎在遵循许可证条款的前提下自由使用、修改与分发。
-[English](README.md) | [中文](README_CN.md)

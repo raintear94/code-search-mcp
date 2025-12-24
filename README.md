@@ -1,3 +1,5 @@
+[![EN](https://img.shields.io/badge/EN-README-blue)](README.md) [![中文](https://img.shields.io/badge/中文-README_CN-red)](README_CN.md)
+
 # Code Search MCP Server
 
 High-performance, batch-oriented MCP (Model Context Protocol) code understanding toolkit for AI agents. Focused on deep parsing, parallel batch processing, and panoramic context to explore large codebases efficiently.
@@ -53,5 +55,3 @@ npm run build
 
 ## Open Source
 This project is open-sourced under the MIT License. You may use, modify, and distribute it under the license terms.
-[English](README.md) | [中文](README_CN.md)
-
