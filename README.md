@@ -53,4 +53,5 @@ npm run build
 
 ## Open Source
 This project is open-sourced under the MIT License. You may use, modify, and distribute it under the license terms.
+[English](README.md) | [中文](README_CN.md)
 

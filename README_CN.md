@@ -57,3 +57,4 @@ npm run build
 
 ## 开源声明
 本项目以 MIT License 开源，欢迎在遵循许可证条款的前提下自由使用、修改与分发。
+[English](README.md) | [中文](README_CN.md)
