@@ -1,0 +1,45 @@
+# 忽略匹配下列规则的Git 提交 V2.1.0
+### gradle ###
+.vscode
+*.exe
+.idea
+*.iws
+*.iml
+*.ipr
+rebel.xml
+
+### vs code ###
+.vscode
+
+nbproject/private/
+build/
+nbbuild/
+dist/
+nbdist/
+.nb-gradle/
+
+### maven ###
+target/
+*.war
+*.ear
+*.zip
+*.tar
+*.tar.gz
+
+
+### logs ####
+/logs/
+*.log
+
+### temp ignore ###
+*.cache
+*.diff
+*.patch
+*.tmp
+*.java~
+*.properties~
+*.xml~
+
+
+### node ###
+node_modules
