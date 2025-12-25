@@ -2,7 +2,8 @@
 
 # Code Search MCP Server
 
-High-performance, batch-oriented MCP (Model Context Protocol) code understanding toolkit for AI agents. Focused on deep parsing, parallel batch processing, and panoramic context to explore large codebases efficiently.
+High-performance, batch-oriented MCP (Model Context Protocol) code understanding toolkit for AI agents, **specially optimized for Java**.
+Focused on deep parsing, parallel batch processing, and panoramic context to explore large codebases efficiently.
 Can significantly accelerate AI development tools' ability to locate code logic.
 
 
