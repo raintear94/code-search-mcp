@@ -176,9 +176,12 @@ export function getPatternsForExtension(ext: string): { regex: RegExp; type: Out
             return [
                 { regex: /(?:public|private|protected|static|final|\s)*class\s+([a-zA-Z0-9_$]+)/, type: "class", nameGroup: 1 },
                 { regex: /(?:public|private|protected|static|final|\s)*interface\s+([a-zA-Z0-9_$]+)/, type: "interface", nameGroup: 1 },
-                { regex: /(?:public|private|protected|static|final|synchronized|async|\s)+[\w<>[\]]+\s+([a-zA-Z0-9_$]+)\s*\([^)]*\)/, type: "method", nameGroup: 1 },
+                { regex: /(?:public|private|protected|static|final|\s)*@interface\s+([a-zA-Z0-9_$]+)/, type: "interface", nameGroup: 1 },
+                { regex: /(?:public|private|protected|static|final|\s)*enum\s+([a-zA-Z0-9_$]+)/, type: "class", nameGroup: 1 },
+                { regex: /(?:public|private|protected|static|final|\s)*record\s+([a-zA-Z0-9_$]+)/, type: "class", nameGroup: 1 },
+                { regex: /(?:public|private|protected|static|final|synchronized|abstract|native|strictfp|default|async|\s)+[\w<>.[\],\s?&]+\s+([a-zA-Z0-9_$]+)\s*\([^)]*\)/, type: "method", nameGroup: 1 },
                 // 增加字段匹配：通常是 private 类型 变量名; 或 @注解 类型 变量名;
-                { regex: /^\s*(?:private|public|protected|static|final)*\s+[\w<>[\]]+\s+([a-zA-Z0-9_$]+)\s*(?:=\s*[^;]+)?\s*;/, type: "field", nameGroup: 1 },
+                { regex: /^\s*(?:private|public|protected|static|final|transient|volatile|\s)+[\w<>.[\],\s?&]+\s+([a-zA-Z0-9_$]+)\s*(?:=\s*[^;]+)?\s*;/, type: "field", nameGroup: 1 },
             ];
         case "py":
             return [

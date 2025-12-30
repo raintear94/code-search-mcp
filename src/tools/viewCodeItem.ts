@@ -17,7 +17,8 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import * as fs from "fs";
 import * as path from "path";
-import { pathExists, isFile } from "../utils/fileSystem.js";
+import { pathExists, isFile, getExtension } from "../utils/fileSystem.js";
+import { parseOutline, OutlineItem } from "./viewFileOutline.js";
 
 /**
  * 默认忽略的目录名称集合。
@@ -40,6 +41,16 @@ const DEFAULT_IGNORE_DIRS = new Set([
 ]);
 
 /**
+ * Java 类路径搜索缓存（key: 根目录|类型|类名）。
+ */
+const JAVA_CLASS_SEARCH_CACHE = new Map<string, string[]>();
+
+/**
+ * Java 根目录缓存（key: 项目根目录）。
+ */
+const JAVA_ROOT_CACHE = new Map<string, string[]>();
+
+/**
  * 代码项提取结果。
  */
 type SnippetResult = {
@@ -60,7 +71,23 @@ function extractSnippet(filePath: string, itemName: string): SnippetResult {
     }
     try {
         const content = fs.readFileSync(filePath, "utf-8");
+        const ext = getExtension(filePath);
         const lines = content.split("\n");
+
+        if (ext === "java") {
+            const outline = parseOutline(content, ext);
+            const outlineRange = findOutlineRange(lines, outline, itemName);
+            if (outlineRange) {
+                const snippet = lines.slice(outlineRange.start, outlineRange.end + 1).join("\n");
+                return {
+                    found: true,
+                    text: `--- 文件: ${filePath} (第 ${outlineRange.start + 1} 行至第 ${outlineRange.end + 1} 行, 定位: '${itemName}') ---\n\n${snippet}`,
+                    startLine: outlineRange.start + 1,
+                    endLine: outlineRange.end + 1,
+                };
+            }
+        }
+
         const itemIndex = lines.findIndex(line => line.includes(itemName));
         if (itemIndex === -1) {
             return { found: false, text: `--- 文件: ${filePath} (错误: 找不到代码项 '${itemName}') ---` };
@@ -90,6 +117,53 @@ function extractSnippet(filePath: string, itemName: string): SnippetResult {
             text: `--- 文件: ${filePath} (错误: 读取失败 - ${error instanceof Error ? error.message : String(error)}) ---`
         };
     }
+}
+
+/**
+ * 基于大纲定位代码块范围。
+ * @param lines 文件行列表
+ * @param outline 大纲列表
+ * @param itemName 代码项名称
+ */
+function findOutlineRange(lines: string[], outline: OutlineItem[], itemName: string): { start: number; end: number } | null {
+    const target = pickOutlineItem(outline, itemName);
+    if (!target) {
+        return null;
+    }
+    const startIndex = Math.max(0, findSignatureStart(lines, Math.max(0, target.startLine - 1)));
+    const endIndex = Math.min(lines.length - 1, (target.endLine ?? target.startLine) - 1);
+    if (endIndex < startIndex) {
+        return null;
+    }
+    return { start: startIndex, end: endIndex };
+}
+
+/**
+ * 从大纲中选择最匹配的条目。
+ * @param outline 大纲列表
+ * @param itemName 代码项名称
+ */
+function pickOutlineItem(outline: OutlineItem[], itemName: string): OutlineItem | null {
+    const candidates = outline.filter(item => item.name === itemName);
+    if (candidates.length === 0) {
+        return null;
+    }
+    const typeWeight: Record<OutlineItem["type"], number> = {
+        method: 1,
+        function: 1,
+        class: 2,
+        interface: 2,
+        field: 3,
+        other: 4,
+    };
+    candidates.sort((a, b) => {
+        const weightDiff = typeWeight[a.type] - typeWeight[b.type];
+        if (weightDiff !== 0) {
+            return weightDiff;
+        }
+        return a.startLine - b.startLine;
+    });
+    return candidates[0];
 }
 
 /**
@@ -280,6 +354,7 @@ function buildCallPathSection(filePath: string, snippetText: string): string | n
     if (!pathExists(filePath) || !isFile(filePath)) {
         return null;
     }
+    const searchRoot = resolveSearchRoot(filePath);
     const content = fs.readFileSync(filePath, "utf-8");
     const lines = content.split("\n");
     const fieldTypeMap = extractFieldTypeMap(lines);
@@ -290,7 +365,7 @@ function buildCallPathSection(filePath: string, snippetText: string): string | n
         if (!typeName) {
             return;
         }
-        const classFiles = findClassFiles(process.cwd(), typeName);
+        const classFiles = findClassFiles(searchRoot, typeName);
         if (classFiles.length === 0) {
             callEntries.push(`${fieldName} -> ${typeName} -> 未找到路径`);
             return;
@@ -306,22 +381,145 @@ function buildCallPathSection(filePath: string, snippetText: string): string | n
 }
 
 /**
- * 全局搜索指定类名对应的 Java 文件。
- * @param rootDir 搜索根目录
+ * 解析检索应使用的项目根目录。
+ * @param filePath 文件路径
+ */
+function resolveSearchRoot(filePath: string): string {
+    return findProjectRoot(filePath) ?? process.cwd();
+}
+
+/**
+ * 查找项目根目录（支持多模块 Maven/Gradle）。
+ * @param startPath 起始路径
+ */
+function findProjectRoot(startPath: string): string | null {
+    let current = path.dirname(startPath);
+    let lastSrcRoot: string | null = null;
+    let lastModuleRoot: string | null = null;
+    let lastBuildRoot: string | null = null;
+
+    while (current !== path.parse(current).root) {
+        const srcPath = path.join(current, "src");
+        const pomPath = path.join(current, "pom.xml");
+        const buildGradlePath = path.join(current, "build.gradle");
+        const settingsGradlePath = path.join(current, "settings.gradle");
+        if (fs.existsSync(srcPath)) {
+            lastSrcRoot = current;
+        }
+        if (fs.existsSync(pomPath) && hasModuleJavaRoots(current)) {
+            lastModuleRoot = current;
+        }
+        if (fs.existsSync(buildGradlePath) || fs.existsSync(settingsGradlePath)) {
+            lastBuildRoot = current;
+        }
+        current = path.dirname(current);
+    }
+    if (lastModuleRoot) {
+        return lastModuleRoot;
+    }
+    return lastBuildRoot ?? lastSrcRoot;
+}
+
+/**
+ * 判断目录下是否存在多个 Java 模块目录。
+ * @param root 根目录
+ */
+function hasModuleJavaRoots(root: string): boolean {
+    try {
+        const entries = fs.readdirSync(root, { withFileTypes: true });
+        let count = 0;
+        for (const entry of entries) {
+            if (!entry.isDirectory()) {
+                continue;
+            }
+            const javaRoot = path.join(root, entry.name, "src/main/java");
+            if (fs.existsSync(javaRoot)) {
+                count += 1;
+                if (count >= 2) {
+                    return true;
+                }
+            }
+        }
+    } catch (e) {
+        return false;
+    }
+    return false;
+}
+
+/**
+ * 获取项目内所有 Java 根目录（src/main/java）。
+ * @param rootDir 项目根目录
+ */
+function getJavaRoots(rootDir: string): string[] {
+    const cached = JAVA_ROOT_CACHE.get(rootDir);
+    if (cached) {
+        return cached;
+    }
+    const roots: string[] = [];
+    const directJavaRoot = path.join(rootDir, "src/main/java");
+    if (fs.existsSync(directJavaRoot)) {
+        roots.push(directJavaRoot);
+    }
+    const stack: string[] = [rootDir];
+    while (stack.length > 0) {
+        const current = stack.pop();
+        if (!current) {
+            continue;
+        }
+        let entries: fs.Dirent[] = [];
+        try {
+            entries = fs.readdirSync(current, { withFileTypes: true });
+        } catch (error) {
+            continue;
+        }
+        for (const entry of entries) {
+            if (!entry.isDirectory()) {
+                continue;
+            }
+            if (DEFAULT_IGNORE_DIRS.has(entry.name)) {
+                continue;
+            }
+            const fullPath = path.join(current, entry.name);
+            const javaRoot = path.join(fullPath, "src/main/java");
+            if (fs.existsSync(javaRoot)) {
+                roots.push(javaRoot);
+                continue;
+            }
+            stack.push(fullPath);
+        }
+    }
+    const uniqueRoots = Array.from(new Set(roots));
+    JAVA_ROOT_CACHE.set(rootDir, uniqueRoots);
+    return uniqueRoots;
+}
+
+/**
+ * 生成 Java 类搜索缓存 Key。
+ * @param rootDir 根目录
+ * @param kind 类型
  * @param className 类名
  */
-function findClassFiles(rootDir: string, className: string): string[] {
+function buildJavaCacheKey(rootDir: string, kind: "class" | "impl", className: string): string {
+    return `${rootDir}|${kind}|${className}`;
+}
+
+/**
+ * 在 Java 根目录中检索指定类名文件。
+ * @param javaRoots Java 根目录列表
+ * @param className 类名
+ * @param classRegex 类定义匹配正则
+ */
+function scanJavaRootsForClass(javaRoots: string[], className: string, classRegex: RegExp): string[] {
     const results: string[] = [];
     const targetFileName = `${className}.java`;
-    const classRegex = new RegExp(`\\b(class|interface|enum)\\s+${className}\\b`);
-    const stack: string[] = [rootDir];
+    const stack: string[] = [...javaRoots];
 
     while (stack.length > 0) {
         const current = stack.pop();
         if (!current) {
             continue;
         }
-        let entries: fs.Dirent[];
+        let entries: fs.Dirent[] = [];
         try {
             entries = fs.readdirSync(current, { withFileTypes: true });
         } catch (error) {
@@ -354,50 +552,38 @@ function findClassFiles(rootDir: string, className: string): string[] {
 }
 
 /**
+ * 全局搜索指定类名对应的 Java 文件。
+ * @param rootDir 搜索根目录
+ * @param className 类名
+ */
+function findClassFiles(rootDir: string, className: string): string[] {
+    const cacheKey = buildJavaCacheKey(rootDir, "class", className);
+    const cached = JAVA_CLASS_SEARCH_CACHE.get(cacheKey);
+    if (cached) {
+        return cached;
+    }
+    const javaRoots = getJavaRoots(rootDir);
+    const classRegex = new RegExp(`\\b(class|interface|enum|record)\\s+${className}\\b`);
+    const results = scanJavaRootsForClass(javaRoots, className, classRegex);
+    JAVA_CLASS_SEARCH_CACHE.set(cacheKey, results);
+    return results;
+}
+
+/**
  * 全局搜索指定实现类名对应的 Java 文件。
  * @param rootDir 搜索根目录
  * @param implClassName 实现类名称
  */
 function findImplFiles(rootDir: string, implClassName: string): string[] {
-    const results: string[] = [];
-    const targetFileName = `${implClassName}.java`;
-    const classRegex = new RegExp(`\\bclass\\s+${implClassName}\\b`);
-    const stack: string[] = [rootDir];
-
-    while (stack.length > 0) {
-        const current = stack.pop();
-        if (!current) {
-            continue;
-        }
-        let entries: fs.Dirent[];
-        try {
-            entries = fs.readdirSync(current, { withFileTypes: true });
-        } catch (error) {
-            continue;
-        }
-        for (const entry of entries) {
-            if (entry.isDirectory()) {
-                if (DEFAULT_IGNORE_DIRS.has(entry.name)) {
-                    continue;
-                }
-                stack.push(path.join(current, entry.name));
-                continue;
-            }
-            if (!entry.isFile() || entry.name !== targetFileName) {
-                continue;
-            }
-            const filePath = path.join(current, entry.name);
-            try {
-                const content = fs.readFileSync(filePath, "utf-8");
-                if (classRegex.test(content)) {
-                    results.push(filePath);
-                }
-            } catch (error) {
-                continue;
-            }
-        }
+    const cacheKey = buildJavaCacheKey(rootDir, "impl", implClassName);
+    const cached = JAVA_CLASS_SEARCH_CACHE.get(cacheKey);
+    if (cached) {
+        return cached;
     }
-
+    const javaRoots = getJavaRoots(rootDir);
+    const classRegex = new RegExp(`\\bclass\\s+${implClassName}\\b`);
+    const results = scanJavaRootsForClass(javaRoots, implClassName, classRegex);
+    JAVA_CLASS_SEARCH_CACHE.set(cacheKey, results);
     return results;
 }
 
@@ -428,6 +614,7 @@ export function registerViewCodeItem(server: McpServer): void {
             // 并发处理所有请求
             const results = await Promise.all(Items.map(async (item) => {
                 const { File, ItemName } = item;
+                const searchRoot = resolveSearchRoot(File);
 
                 const resultSnippets: string[] = [];
                 const mainSnippet = extractSnippet(File, ItemName);
@@ -444,7 +631,7 @@ export function registerViewCodeItem(server: McpServer): void {
                 }
                 const implClassName = buildImplClassName(File);
                 if (implClassName) {
-                    const implFiles = findImplFiles(process.cwd(), implClassName);
+                    const implFiles = findImplFiles(searchRoot, implClassName);
                     implFiles.forEach(filePath => implCandidates.add(filePath));
                 }
                 if (implCandidates.size > 0) {

@@ -26,6 +26,16 @@ interface JavaFieldInfo {
     type: string;
     comment: string;
 }
+
+/**
+ * Java 根目录缓存（key: 项目根目录, value: src/main/java 列表）。
+ */
+const javaRootCache = new Map<string, string[]>();
+
+/**
+ * Java 类路径解析缓存（key: 项目根目录|类全名, value: 解析结果）。
+ */
+const javaResolveCache = new Map<string, string | null>();
 /**
  * 注册核心全景工具
  */
@@ -65,6 +75,11 @@ export function registerViewFilesFullContext(server: McpServer): void {
 
             const sortedPaths = [...AbsolutePaths].sort((a, b) => roleWeight(a) - roleWeight(b));
 
+            /**
+             * 去重后的模型类集合（DTO/VO/Entity 等）
+             */
+            const globalModelImports = new Map<string, ResolvedImportInfo>();
+
             const results = await Promise.all(sortedPaths.map(async (AbsolutePath) => {
                 // 2. 移除硬编码，改用通用寻找根目录逻辑
                 if (!pathExists(AbsolutePath) || !isFile(AbsolutePath)) {
@@ -78,8 +93,11 @@ export function registerViewFilesFullContext(server: McpServer): void {
                     const lines = fullContent.split("\n");
 
                     const effectiveStart = Math.max(1, StartLine || 1);
-                    const effectiveEnd = EndLine || Math.min(lines.length, effectiveStart + 499);
+                    const baseEnd = EndLine || Math.min(lines.length, effectiveStart + 499);
+                    const effectiveEnd = extendEndLineToMethodBoundary(ext, fullContent, effectiveStart, baseEnd, lines.length);
                     const slicedContent = lines.slice(effectiveStart - 1, effectiveEnd).join("\n");
+                    const useRangeFilter = effectiveStart > 1 || effectiveEnd < lines.length;
+                    const referencedTypes = useRangeFilter ? extractReferencedTypeNames(slicedContent) : null;
 
                     let output = `[FILE_PATH]: ${AbsolutePath}\n`;
                     output += `[PAGINATION]: Lines ${effectiveStart}-${effectiveEnd} (Total ${lines.length})\n`;
@@ -87,7 +105,7 @@ export function registerViewFilesFullContext(server: McpServer): void {
                     if (ext === "java") {
                         // 依赖注入增强：列出注入的字段 (Service/Mapper/MQ/Redis)
                         output += `\n[DEPENDENCY_INJECTIONS]: (Injected Components)\n`;
-                        const fieldMatches = fullContent.matchAll(/private\s+(?:final\s+)?([A-Z][a-zA-Z0-9_<>,\s?]+)\s+([a-zA-Z0-9]+)\s*;/g);
+                        const fieldMatches = fullContent.matchAll(/(?:private|protected|public)?\s+(?:static\s+)?(?:final\s+)?([A-Z][a-zA-Z0-9_<>,\s?]+)\s+([a-zA-Z0-9_$]+)\s*;/g);
                         let hasInjections = false;
                         for (const match of fieldMatches) {
                             const type = match[1].trim();
@@ -167,25 +185,18 @@ export function registerViewFilesFullContext(server: McpServer): void {
 
                                 const modelImports = resolvedImports.filter(item => {
                                     const simpleName = item.className.split('.').pop() || "";
+                                    if (useRangeFilter && referencedTypes && !referencedTypes.simpleNames.has(simpleName)) {
+                                        return false;
+                                    }
                                     return isModelLikeClass(simpleName, item.resolvedPath);
                                 });
                                 const otherImports = resolvedImports.filter(item => !modelImports.includes(item));
 
                                 if (modelImports.length > 0) {
-                                    output += `\n[MODEL_FIELDS]: (DTO/VO/Entity Fields)\n`;
-                                    modelImports.slice(0, 15).forEach(item => {
-                                        const simpleName = item.className.split('.').pop() || "";
-                                        const content = fs.readFileSync(item.resolvedPath, "utf-8");
-                                        const fields = extractJavaFieldDetails(content);
-                                        output += `>> ${simpleName} => ${item.resolvedPath}\n`;
-                                        if (fields.length === 0) {
-                                            output += `   - (No fields detected)\n`;
-                                            return;
+                                    modelImports.forEach(item => {
+                                        if (!globalModelImports.has(item.resolvedPath)) {
+                                            globalModelImports.set(item.resolvedPath, item);
                                         }
-                                        fields.forEach(field => {
-                                            const comment = field.comment ? field.comment : "无注释";
-                                            output += `   - ${field.name} | ${field.type} | ${comment}\n`;
-                                        });
                                     });
                                 }
 
@@ -209,6 +220,22 @@ export function registerViewFilesFullContext(server: McpServer): void {
                         }
                     }
 
+                    if (useRangeFilter && referencedTypes) {
+                        referencedTypes.fullClassNames.forEach(className => {
+                            const resolved = resolveJavaPathGeneric(AbsolutePath, className);
+                            if (!resolved || !pathExists(resolved)) {
+                                return;
+                            }
+                            const simpleName = className.split(".").pop() || "";
+                            if (!isModelLikeClass(simpleName, resolved)) {
+                                return;
+                            }
+                            if (!globalModelImports.has(resolved)) {
+                                globalModelImports.set(resolved, { className, resolvedPath: resolved });
+                            }
+                        });
+                    }
+
                     output += `\n[SOURCE_CODE]:\n${slicedContent}`;
                     return output;
                 } catch (e) {
@@ -217,10 +244,64 @@ export function registerViewFilesFullContext(server: McpServer): void {
             }));
 
             return {
-                content: [{ type: "text", text: results.join("\n\n" + "#".repeat(70) + "\n\n") }],
+                content: [{
+                    type: "text",
+                    text: buildFullContextOutput(results, globalModelImports),
+                }],
             } as any;
         }
     );
+}
+
+/**
+ * 组装最终输出内容，追加去重后的模型类字段信息。
+ *
+ * @param results 每个文件的输出结果
+ * @param globalModelImports 全局模型类集合
+ */
+function buildFullContextOutput(results: string[], globalModelImports: Map<string, ResolvedImportInfo>): string {
+    const separator = "\n\n" + "#".repeat(70) + "\n\n";
+    const blocks: string[] = [];
+    blocks.push(results.join(separator));
+    const globalModelSection = buildGlobalModelSection(globalModelImports);
+    if (globalModelSection) {
+        blocks.push(globalModelSection);
+    }
+    return blocks.join(separator);
+}
+
+/**
+ * 生成去重后的 DTO/VO/Entity 等模型字段块。
+ *
+ * @param globalModelImports 全局模型类集合
+ */
+function buildGlobalModelSection(globalModelImports: Map<string, ResolvedImportInfo>): string {
+    if (globalModelImports.size === 0) {
+        return "";
+    }
+    const items = Array.from(globalModelImports.values()).sort((a, b) => a.className.localeCompare(b.className));
+    let output = `[GLOBAL_MODEL_FIELDS]: (DTO/VO/Entity Fields - Deduped)\n`;
+    items.forEach(item => {
+        const simpleName = item.className.split('.').pop() || "";
+        output += `>> ${simpleName} => ${item.resolvedPath}\n`;
+        let content = "";
+        try {
+            content = fs.readFileSync(item.resolvedPath, "utf-8");
+        } catch (e) {
+            output += `   - (读取失败)\n`;
+            return;
+        }
+        const fields = extractJavaFieldDetails(content);
+        if (fields.length === 0) {
+            output += `   - (No fields detected)\n`;
+            return;
+        }
+        fields.forEach(field => {
+            const comment = field.comment ? field.comment : "无注释";
+            output += `   - ${field.name} | ${field.type} | ${comment}\n`;
+        });
+    });
+    return output;
 }
 
 /**
@@ -352,7 +433,7 @@ function extractJavaFieldDetails(content: string): JavaFieldInfo[] {
             continue;
         }
 
-        if (trimLine.includes("(")) {
+        if (trimLine.includes("(") && !trimLine.includes("=")) {
             pendingComment = "";
             continue;
         }
@@ -370,6 +451,81 @@ function extractJavaFieldDetails(content: string): JavaFieldInfo[] {
     }
 
     return results;
+}
+
+/**
+ * 如果截取范围末尾位于方法内部，则扩展到方法结束行。
+ *
+ * @param ext 文件扩展名
+ * @param fullContent 文件完整内容
+ * @param startLine 起始行（1-based）
+ * @param endLine 结束行（1-based）
+ * @param totalLines 总行数
+ */
+function extendEndLineToMethodBoundary(
+    ext: string,
+    fullContent: string,
+    startLine: number,
+    endLine: number,
+    totalLines: number
+): number {
+    const safeEnd = Math.min(endLine, totalLines);
+    if (safeEnd >= totalLines) {
+        return safeEnd;
+    }
+    if (ext !== "java") {
+        return safeEnd;
+    }
+    const outline = parseOutline(fullContent, ext);
+    if (!outline || outline.length === 0) {
+        return safeEnd;
+    }
+    const candidates = outline.filter(item => {
+        if (item.type !== "method") {
+            return false;
+        }
+        const itemEnd = item.endLine ?? item.startLine;
+        return item.startLine <= safeEnd && itemEnd >= safeEnd && itemEnd >= startLine;
+    });
+    if (candidates.length === 0) {
+        return safeEnd;
+    }
+    let target = candidates[0];
+    for (const candidate of candidates.slice(1)) {
+        const candidateEnd = candidate.endLine ?? candidate.startLine;
+        const targetEnd = target.endLine ?? target.startLine;
+        if (candidateEnd < targetEnd) {
+            target = candidate;
+        }
+    }
+    const targetEnd = target.endLine ?? target.startLine;
+    return Math.min(totalLines, Math.max(safeEnd, targetEnd));
+}
+
+/**
+ * 提取片段中出现的类型名称（简单类名与全限定名）。
+ *
+ * @param content 代码片段内容
+ */
+function extractReferencedTypeNames(content: string): { simpleNames: Set<string>; fullClassNames: Set<string> } {
+    const simpleNames = new Set<string>();
+    const fullClassNames = new Set<string>();
+    const simpleNameRegex = /\b[A-Z][A-Za-z0-9_]*\b/g;
+    const fullNameRegex = /\b[a-z_][\w]*(?:\.[a-z_][\w]*)+\.[A-Z][A-Za-z0-9_]*\b/g;
+
+    let match: RegExpExecArray | null;
+    while ((match = simpleNameRegex.exec(content)) !== null) {
+        simpleNames.add(match[0]);
+    }
+    while ((match = fullNameRegex.exec(content)) !== null) {
+        const fullName = match[0];
+        fullClassNames.add(fullName);
+        const simpleName = fullName.split(".").pop();
+        if (simpleName) {
+            simpleNames.add(simpleName);
+        }
+    }
+    return { simpleNames, fullClassNames };
 }
 
 /**
@@ -525,36 +681,67 @@ function resolveJavaPathGeneric(currentPath: string, fullClassName: string): str
     const root = findProjectRoot(currentPath);
     if (!root) return null;
 
+    const cacheKey = `${root}|${fullClassName}`;
+    if (javaResolveCache.has(cacheKey)) {
+        return javaResolveCache.get(cacheKey) ?? null;
+    }
+
     const pathPart = fullClassName.replace(/\./g, "/");
-    const directJavaRoot = path.join(root, "src/main/java");
-    if (fs.existsSync(directJavaRoot)) {
-        const directTarget = path.join(directJavaRoot, `${pathPart}.java`);
-        if (fs.existsSync(directTarget)) {
-            return directTarget;
+    const javaRoots = getJavaRoots(root);
+    for (const javaRoot of javaRoots) {
+        const target = path.join(javaRoot, `${pathPart}.java`);
+        if (fs.existsSync(target)) {
+            javaResolveCache.set(cacheKey, target);
+            return target;
         }
     }
 
-    const findInDir = (dir: string): string | null => {
-        try {
-            const entries = fs.readdirSync(dir, { withFileTypes: true });
-            for (const entry of entries) {
-                if (entry.isDirectory()) {
-                    const fullPath = path.join(dir, entry.name);
-                    const javaRoot = path.join(fullPath, "src/main/java");
-                    if (fs.existsSync(javaRoot)) {
-                        const target = path.join(javaRoot, `${pathPart}.java`);
-                        if (fs.existsSync(target)) return target;
-                    } else if (entry.name !== "node_modules" && entry.name !== ".git" && !entry.name.startsWith(".")) {
-                        const found = findInDir(fullPath);
-                        if (found) return found;
-                    }
-                }
-            }
-        } catch (e) { return null; }
-        return null;
-    };
+    javaResolveCache.set(cacheKey, null);
+    return null;
+}
 
-    return findInDir(root);
+/**
+ * 读取工程内所有 Java 根目录（src/main/java）。
+ *
+ * @param root 项目根目录
+ */
+function getJavaRoots(root: string): string[] {
+    const cached = javaRootCache.get(root);
+    if (cached) {
+        return cached;
+    }
+    const roots: string[] = [];
+    const directJavaRoot = path.join(root, "src/main/java");
+    if (fs.existsSync(directJavaRoot)) {
+        roots.push(directJavaRoot);
+    }
+    const walk = (dir: string) => {
+        let entries: fs.Dirent[] = [];
+        try {
+            entries = fs.readdirSync(dir, { withFileTypes: true });
+        } catch (e) {
+            return;
+        }
+        for (const entry of entries) {
+            if (!entry.isDirectory()) {
+                continue;
+            }
+            if (entry.name === "node_modules" || entry.name === ".git" || entry.name.startsWith(".")) {
+                continue;
+            }
+            const fullPath = path.join(dir, entry.name);
+            const javaRoot = path.join(fullPath, "src/main/java");
+            if (fs.existsSync(javaRoot)) {
+                roots.push(javaRoot);
+                continue;
+            }
+            walk(fullPath);
+        }
+    };
+    walk(root);
+    const uniqueRoots = Array.from(new Set(roots));
+    javaRootCache.set(root, uniqueRoots);
+    return uniqueRoots;
 }
 
 /**
